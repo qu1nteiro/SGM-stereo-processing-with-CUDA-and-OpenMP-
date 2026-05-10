@@ -1,0 +1,39 @@
+Legion s/carregador: 
+
+cp0103@banana:~/projeto1/src/cp_sgm$ ./sgmCuda 
+Host processing time: 2841.849365 (ms)
+Device processing time: 0.001728 (ms)
+
+Chuwi s/carregador:
+
+cp0103@banana:~/projeto1/src/cp_sgm$ ./sgmCuda 
+Host processing time: 2013.275635 (ms)
+Device processing time: 0.001664 (ms)
+
+
+
+Stage 1 | Version 1 — determine_costs() parallelized
+====================================
+
+Before any implementation, sgmOpenMP() was empty, so the OpenMP time
+was naturally 0 ms. The host reference consistently runs at approximately
+2820 ms across all runs.
+
+After parallelizing determine_costs(), the effect of thread count on
+OpenMP execution time was measured:
+
+Threads | Run 1 (ms) | Run 2 (ms) | Run 3 (ms) | Avg (ms)
+--------|------------|------------|------------|----------
+1       | 2819.97    | 2793.91    |     -      |  ~2807
+4       | 2802.23    | 2798.38    | 2801.06    |  ~2800
+6       | 2793.06    | 2789.08    | 2788.81    |  ~2790
+8       | 2810.41    | 2812.42    | 2815.40    |  ~2813
+24      | 2829.99    | 2835.82    |     -      |  ~2833
+
+The best result was achieved with 6 threads (~2790 ms), representing a
+reduction of roughly 30 ms relative to the sequential baseline — under
+1% improvement. This is consistent with Amdahl's Law: determine_costs()
+is computationally lightweight relative to the total workload, which is
+dominated by iterate_direction(). Beyond 6 threads, coordination overhead
+exceeds the parallelism gain, causing times to worsen. The next version
+will target iterate_direction(), where the real speedup is expected.
