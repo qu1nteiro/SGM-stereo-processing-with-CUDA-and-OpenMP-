@@ -1,0 +1,79 @@
+
+======================================================================
+  SGM OpenMP Benchmark
+  Runs per image : 20  (1 warmup + 19 timed)
+  Date           : dom mai 10 22:41:11 WEST 2026
+======================================================================
+
+  ------------------------------------------------------------------
+  Processing image: bull
+  ------------------------------------------------------------------
+
+  Image: bull
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    OpenMP (ms)      Speedup
+  Mean:               2079.26        2091.37         1.0x
+  Std Dev:              41.00          42.63
+  Min:                2016.12        2041.56
+  Max:                2133.13        2151.83
+
+
+  ------------------------------------------------------------------
+  Processing image: cones
+  ------------------------------------------------------------------
+
+  Image: cones
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    OpenMP (ms)      Speedup
+  Mean:               2164.02        2180.73         1.0x
+  Std Dev:              49.97          44.03
+  Min:                2107.16        2128.33
+  Max:                2246.21        2252.00
+
+
+  ------------------------------------------------------------------
+  Processing image: teddy
+  ------------------------------------------------------------------
+
+  Image: teddy
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    OpenMP (ms)      Speedup
+  Mean:               2149.67        2158.01         1.0x
+  Std Dev:              44.55          43.64
+  Min:                2082.98        2094.28
+  Max:                2201.99        2218.51
+
+
+  ------------------------------------------------------------------
+  Processing image: venus
+  ------------------------------------------------------------------
+
+  Image: venus
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    OpenMP (ms)      Speedup
+  Mean:               2063.40        2075.37         1.0x
+  Std Dev:              39.20          41.63
+  Min:                1998.88        2013.33
+  Max:                2105.46        2126.47
+
+
+======================================================================
+  SUMMARY
+======================================================================
+  Image     Correctness    Mean Host(ms)    Mean OMP(ms)     Speedup
+  ------------------------------------------------------------------
+  bull      PASS                 2079.26         2091.37        1.0x
+  cones     PASS                 2164.02         2180.73        1.0x
+  teddy     PASS                 2149.67         2158.01        1.0x
+  venus     PASS                 2063.40         2075.37        1.0x
+
+  Full results saved to: results_openmp.txt
+
