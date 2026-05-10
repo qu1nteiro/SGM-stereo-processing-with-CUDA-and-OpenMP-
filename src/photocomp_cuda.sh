@@ -1,13 +1,13 @@
 #!/bin/bash
 # ============================================================
-# SGM OpenMP Benchmark Script
+# SGM CUDA Benchmark Script
 # ============================================================
 
-EXEC="./sgmOpenMP"
+EXEC="./sgmCuda"
 N_RUNS=20
 IMAGES=("bull" "cones" "teddy" "venus")
-SUFFIX="openmp"
-RESULTS_FILE="results_openmp.txt"
+SUFFIX="cuda"
+RESULTS_FILE="results_cuda.txt"
 
 # ============================================================
 
@@ -35,7 +35,7 @@ declare -a SUM_IMG SUM_CORRECT SUM_H_MEAN SUM_D_MEAN SUM_SPEEDUP
 
 echo ""
 echo "======================================================================"
-echo "  SGM OpenMP Benchmark"
+echo "  SGM CUDA Benchmark"
 printf "  Runs per image : %d  (1 warmup + %d timed)\n" "$N_RUNS" "$((N_RUNS-1))"
 echo "  Date           : $(date)"
 echo "======================================================================"
@@ -76,7 +76,7 @@ for img in "${IMAGES[@]}"; do
         [ "$run" -eq 1 ] && continue
 
         host_val=$(echo "$output" | grep -i "Host processing time:" | grep -oE '[0-9]+([.][0-9]+)?' | head -1)
-        dev_val=$(echo "$output"  | grep -i "OpenMP processing time:" | grep -oE '[0-9]+([.][0-9]+)?' | head -1)
+        dev_val=$(echo "$output"  | grep -i "Device processing time:" | grep -oE '[0-9]+([.][0-9]+)?' | head -1)
 
         if [ -z "$host_val" ] || [ -z "$dev_val" ]; then
             echo "  WARNING: Could not parse timing from run $run for '$img' — skipping." >&2
@@ -110,7 +110,7 @@ for img in "${IMAGES[@]}"; do
     echo "  Correctness: $correctness"
     printf "  Runs: %d (1 warmup discarded)\n" "$n_timed"
     echo ""
-    printf "  %-12s %14s %14s %12s\n" ""         "Host (ms)"  "OpenMP (ms)" "Speedup"
+    printf "  %-12s %14s %14s %12s\n" ""         "Host (ms)"  "Device (ms)" "Speedup"
     printf "  %-12s %14s %14s %12s\n" "Mean:"    "$h_mean"    "$d_mean"     "${speedup}x"
     printf "  %-12s %14s %14s\n"      "Std Dev:" "$h_std"     "$d_std"
     printf "  %-12s %14s %14s\n"      "Min:"     "$h_min"     "$d_min"
@@ -130,7 +130,7 @@ echo "======================================================================"
 echo "  SUMMARY"
 echo "======================================================================"
 printf "  %-8s  %-12s  %14s  %14s  %10s\n" \
-    "Image" "Correctness" "Mean Host(ms)" "Mean OMP(ms)" "Speedup"
+    "Image" "Correctness" "Mean Host(ms)" "Mean Dev(ms)" "Speedup"
 echo "  ------------------------------------------------------------------"
 for ((i=0; i<${#SUM_IMG[@]}; i++)); do
     if [ "${SUM_H_MEAN[$i]}" = "N/A" ]; then
