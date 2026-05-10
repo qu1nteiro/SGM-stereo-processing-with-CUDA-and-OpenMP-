@@ -37,6 +37,20 @@
 // store negative values.
 typedef int pixel_t;
 
+/* ============================================================
+ * Texture references for the two input images.
+ *
+ * Declared at file scope so that all device kernels can access
+ * them. Texture memory is read-only and backed by a dedicated
+ * cache optimised for the spatial access patterns used in SGM
+ * (each thread reads a pixel and its immediate neighbours).
+ *
+ * The images are bound to these references in sgmDevice() after
+ * the data has been copied to VRAM, and unbound before freeing.
+ * ============================================================ */
+texture<int, 1, cudaReadModeElementType> tex_left;
+texture<int, 1, cudaReadModeElementType> tex_right;
+
 /* function headers */
 
 void determine_costs(const pixel_t *left_image, const pixel_t *right_image, int *costs, 
@@ -298,6 +312,14 @@ void create_disparity_view( const int *accumulated_costs , pixel_t * disp_image,
 }
 
 
+ 
+
+/*
+ * Links:
+ * http://www.dlr.de/rmc/rm/en/desktopdefault.aspx/tabid-9389/16104_read-39811/
+ * http://lunokhod.org/?p=1356
+ */
+
 /* ============================================================
  * CUDA KERNELS — Parallelisation step 1: determine_costs
  *
@@ -330,41 +352,329 @@ __global__ void kernel_fill(int *arr, int value, int n)
 }
 
 /* ------------------------------------------------------------
- * kernel_determine_costs
+ * kernel_determine_costs  [shared memory]
  *
  * Each thread owns one (j, d) pair.
- *   j — image row  [0, ny)
- *   d — disparity  [0, disp_range)
+ *   j — image row  [0, ny)    mapped from threadIdx.x / blockIdx.x
+ *   d — disparity  [0, disp_range) mapped from threadIdx.y / blockIdx.y
  *
- * For every valid column i >= d the thread writes the absolute
- * pixel difference between the left image at (i, j) and the right
- * image shifted left by d pixels, i.e. at (i-d, j). This is the
- * Birchfield-Tomasi cost used by the SGM algorithm.
+ * Shared memory optimisation:
+ *   Within a 16×16 block, all 16 threads sharing the same threadIdx.x
+ *   (same row j) read the SAME left_image pixel for every column i.
+ *   Instead of 16 separate global memory reads, we load that pixel
+ *   once into shared memory (one entry per j in the block) and let
+ *   all 16 disparity threads read it from there.
  *
- * Entries with i < d remain at the sentinel value of 255 set by
- * kernel_fill — no right-image pixel exists that far to the left.
+ *   s_left[threadIdx.x] holds left_image[i + j * nx] for this block's
+ *   j values. It is refreshed every iteration of the i loop.
+ *
+ * __syncthreads() rule:
+ *   __syncthreads() must be reached by every thread in the block —
+ *   an early `return` on out-of-bounds threads would deadlock the rest.
+ *   We therefore use a `valid` flag instead of return, and loop i from
+ *   0 to nx for all threads so sync points are always hit uniformly.
+ *   Out-of-bounds threads participate in the syncs but write nothing.
+ *
+ * The iterate_direction kernels read left_image through the texture
+ * cache (tex_left). Here we use shared memory instead because the
+ * access pattern — many threads reading the same pixel simultaneously
+ * — is better served by an explicit shared buffer than by the texture
+ * cache, which is optimised for spatial locality across different
+ * addresses rather than many threads hitting one address.
  * ------------------------------------------------------------ */
 __global__ void kernel_determine_costs(const pixel_t *left_image,
                                        const pixel_t *right_image,
                                        int *costs,
                                        int nx, int ny, int disp_range)
 {
-    /* Map this thread to its (j, d) coordinates */
+    /* One left-image pixel per j-lane in this block */
+    __shared__ int s_left[16];
+
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int d = blockIdx.y * blockDim.y + threadIdx.y;
 
-    /* Discard threads that land outside the valid image/disparity range */
-    if (j >= ny || d >= disp_range) return;
+    /* Flag instead of early return — keeps all threads alive for syncthreads */
+    int valid = (j < ny && d < disp_range);
 
-    /* Walk every column that has a valid right-image counterpart */
-    for (int i = d; i < nx; i++) {
-        costs[i * disp_range + j * nx * disp_range + d] =
-            abs(left_image[i + j * nx] - right_image[(i - d) + j * nx]);
+    for (int i = 0; i < nx; i++) {
+
+        /* Load left pixel once per j — only the first disparity thread loads */
+        if (threadIdx.y == 0 && j < ny)
+            s_left[threadIdx.x] = left_image[i + j * nx];
+
+        /* All threads wait until every j-lane has its pixel loaded */
+        __syncthreads();
+
+        /* Write cost for valid threads where a right-image match exists */
+        if (valid && i >= d) {
+            costs[i * disp_range + j * nx * disp_range + d] =
+                abs(s_left[threadIdx.x] - right_image[(i - d) + j * nx]);
+        }
+
+        /* Barrier before next iteration overwrites s_left */
+        __syncthreads();
     }
 }
 
 /* ============================================================
- * END OF CUDA KERNELS — Parallelisation step 1
+ * CUDA KERNELS — Parallelisation step 2: iterate_direction (optimised)
+ *
+ * KEY CHANGE vs the original kernels:
+ *
+ * Original: 1 thread per path. Inside device_evaluate_path(),
+ *   a nested loop over all (d, d_p) pairs costs O(disp_range²)
+ *   per column. With ny=375 threads total, GPU occupancy is ~25%.
+ *
+ * Optimised: disp_range=32 threads per path (one block per row
+ *   or column). Each thread computes exactly one disparity value.
+ *
+ *   1. PARALLEL REDUCTION (from the reduction slides):
+ *      min_prior = min over all d of prior[d]
+ *      Computed with the sequential-addressing tree reduction
+ *      taught in class — O(log disp_range) steps, no bank
+ *      conflicts, all threads stay active.
+ *
+ *   2. O(1) SMOOTHNESS FORMULA:
+ *      The standard SGM smoothness term simplifies to:
+ *
+ *        e_smooth(d) = min(
+ *          prior[d],               -- same disparity, no penalty
+ *          prior[d-1] + P1,        -- left neighbour
+ *          prior[d+1] + P1,        -- right neighbour
+ *          min_prior + P_big       -- all other disparities
+ *        )
+ *
+ *      This is mathematically equivalent to the original O(32)
+ *      loop because P_big >= P1: when the global min falls on a
+ *      neighbour, the explicit neighbour term (prior[d±1] + P1)
+ *      is always <= (prior[d±1] + P_big), so the neighbour term
+ *      already wins. Including the neighbour in min_prior never
+ *      changes the overall minimum.
+ *
+ *   3. COALESCED WRITES: the 32 d-threads write to consecutive
+ *      addresses in accumulated_costs — one 128-byte transaction.
+ *
+ * Result: 375×32 = 12,000 active threads vs 375 before.
+ *
+ * Grid layout for all four kernels:
+ *   blockDim = disp_range (= 32 threads, one warp)
+ *   gridDim  = ny (horizontal) or nx (vertical) — one block per path
+ * ============================================================ */
+
+/* ------------------------------------------------------------
+ * device_min_reduction
+ *
+ * Parallel tree reduction (sequential addressing, from slides)
+ * to find the minimum of s_buf[0..disp_range-1].
+ * Result is in s_buf[0] after the call.
+ * All threads in the block must call this function.
+ * ------------------------------------------------------------ */
+__device__ void device_min_reduction(int *s_buf, int d, int disp_range)
+{
+    for (int stride = disp_range / 2; stride > 0; stride >>= 1) {
+        if (d < stride)
+            s_buf[d] = MMIN(s_buf[d], s_buf[d + stride]);
+        __syncthreads();
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_dirxpos  (left to right, dirx = +1)
+ *
+ * blockIdx.x = row j, threadIdx.x = disparity d
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_dirxpos(const int *costs,
+                                       int *accumulated_costs,
+                                       int nx, int ny, int disp_range)
+{
+    __shared__ int s_prior[32];   /* path state: cost at previous column  */
+    __shared__ int s_reduce[32];  /* reduction scratch buffer              */
+    __shared__ int s_min_prior;   /* result: min of s_prior                */
+
+    int j = blockIdx.x;
+    int d = threadIdx.x;
+
+    /* Border pixel: no prior, take local cost directly */
+    s_prior[d] = COSTS(0, j, d);
+    ACCUMULATED_COSTS(0, j, d) = s_prior[d];
+    __syncthreads();
+
+    for (int i = 1; i < nx; i++) {
+
+        /* Step 1: parallel min reduction on s_prior → s_min_prior */
+        s_reduce[d] = s_prior[d];
+        __syncthreads();
+        device_min_reduction(s_reduce, d, disp_range);
+        if (d == 0) s_min_prior = s_reduce[0];
+        __syncthreads();
+
+        /* Step 2: intensity gradient between columns (read via texture) */
+        int gradient   = abs(tex1Dfetch(tex_left, i + j * nx) -
+                             tex1Dfetch(tex_left, (i-1) + j * nx));
+        int penalty_big = MMAX(PENALTY1,
+                               gradient ? PENALTY2 / gradient : PENALTY2);
+
+        /* Step 3: O(1) smoothness — read own value and neighbours from shared */
+        int p_same  = s_prior[d];
+        int p_left  = (d > 0)              ? s_prior[d-1] + PENALTY1 : INT_MAX;
+        int p_right = (d < disp_range - 1) ? s_prior[d+1] + PENALTY1 : INT_MAX;
+        int p_far   = s_min_prior + penalty_big;
+
+        int e_smooth = MMIN(p_same, MMIN(p_left, MMIN(p_right, p_far)));
+
+        /* Step 4: path cost = local + smoothness − min_prior (SGM normalisation) */
+        int curr = COSTS(i, j, d) + e_smooth - s_min_prior;
+
+        ACCUMULATED_COSTS(i, j, d) = curr;
+
+        /* curr becomes prior for the next column */
+        s_prior[d] = curr;
+        __syncthreads();
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_dirxneg  (right to left, dirx = -1)
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_dirxneg(const int *costs,
+                                       int *accumulated_costs,
+                                       int nx, int ny, int disp_range)
+{
+    __shared__ int s_prior[32];
+    __shared__ int s_reduce[32];
+    __shared__ int s_min_prior;
+
+    int j = blockIdx.x;
+    int d = threadIdx.x;
+
+    /* Border pixel: right edge */
+    s_prior[d] = COSTS(nx-1, j, d);
+    ACCUMULATED_COSTS(nx-1, j, d) = s_prior[d];
+    __syncthreads();
+
+    for (int i = nx-2; i >= 0; i--) {
+
+        s_reduce[d] = s_prior[d];
+        __syncthreads();
+        device_min_reduction(s_reduce, d, disp_range);
+        if (d == 0) s_min_prior = s_reduce[0];
+        __syncthreads();
+
+        int gradient    = abs(tex1Dfetch(tex_left, i + j * nx) -
+                              tex1Dfetch(tex_left, (i+1) + j * nx));
+        int penalty_big = MMAX(PENALTY1,
+                               gradient ? PENALTY2 / gradient : PENALTY2);
+
+        int p_same  = s_prior[d];
+        int p_left  = (d > 0)              ? s_prior[d-1] + PENALTY1 : INT_MAX;
+        int p_right = (d < disp_range - 1) ? s_prior[d+1] + PENALTY1 : INT_MAX;
+        int p_far   = s_min_prior + penalty_big;
+
+        int e_smooth = MMIN(p_same, MMIN(p_left, MMIN(p_right, p_far)));
+        int curr     = COSTS(i, j, d) + e_smooth - s_min_prior;
+
+        ACCUMULATED_COSTS(i, j, d) = curr;
+        s_prior[d] = curr;
+        __syncthreads();
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_dirypos  (top to bottom, diry = +1)
+ *
+ * blockIdx.x = column i, threadIdx.x = disparity d
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_dirypos(const int *costs,
+                                       int *accumulated_costs,
+                                       int nx, int ny, int disp_range)
+{
+    __shared__ int s_prior[32];
+    __shared__ int s_reduce[32];
+    __shared__ int s_min_prior;
+
+    int i = blockIdx.x;
+    int d = threadIdx.x;
+
+    /* Border pixel: top edge */
+    s_prior[d] = COSTS(i, 0, d);
+    ACCUMULATED_COSTS(i, 0, d) = s_prior[d];
+    __syncthreads();
+
+    for (int j = 1; j < ny; j++) {
+
+        s_reduce[d] = s_prior[d];
+        __syncthreads();
+        device_min_reduction(s_reduce, d, disp_range);
+        if (d == 0) s_min_prior = s_reduce[0];
+        __syncthreads();
+
+        int gradient    = abs(tex1Dfetch(tex_left, i + j * nx) -
+                              tex1Dfetch(tex_left, i + (j-1) * nx));
+        int penalty_big = MMAX(PENALTY1,
+                               gradient ? PENALTY2 / gradient : PENALTY2);
+
+        int p_same  = s_prior[d];
+        int p_left  = (d > 0)              ? s_prior[d-1] + PENALTY1 : INT_MAX;
+        int p_right = (d < disp_range - 1) ? s_prior[d+1] + PENALTY1 : INT_MAX;
+        int p_far   = s_min_prior + penalty_big;
+
+        int e_smooth = MMIN(p_same, MMIN(p_left, MMIN(p_right, p_far)));
+        int curr     = COSTS(i, j, d) + e_smooth - s_min_prior;
+
+        ACCUMULATED_COSTS(i, j, d) = curr;
+        s_prior[d] = curr;
+        __syncthreads();
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_diryneg  (bottom to top, diry = -1)
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_diryneg(const int *costs,
+                                       int *accumulated_costs,
+                                       int nx, int ny, int disp_range)
+{
+    __shared__ int s_prior[32];
+    __shared__ int s_reduce[32];
+    __shared__ int s_min_prior;
+
+    int i = blockIdx.x;
+    int d = threadIdx.x;
+
+    /* Border pixel: bottom edge */
+    s_prior[d] = COSTS(i, ny-1, d);
+    ACCUMULATED_COSTS(i, ny-1, d) = s_prior[d];
+    __syncthreads();
+
+    for (int j = ny-2; j >= 0; j--) {
+
+        s_reduce[d] = s_prior[d];
+        __syncthreads();
+        device_min_reduction(s_reduce, d, disp_range);
+        if (d == 0) s_min_prior = s_reduce[0];
+        __syncthreads();
+
+        int gradient    = abs(tex1Dfetch(tex_left, i + j * nx) -
+                              tex1Dfetch(tex_left, i + (j+1) * nx));
+        int penalty_big = MMAX(PENALTY1,
+                               gradient ? PENALTY2 / gradient : PENALTY2);
+
+        int p_same  = s_prior[d];
+        int p_left  = (d > 0)              ? s_prior[d-1] + PENALTY1 : INT_MAX;
+        int p_right = (d < disp_range - 1) ? s_prior[d+1] + PENALTY1 : INT_MAX;
+        int p_far   = s_min_prior + penalty_big;
+
+        int e_smooth = MMIN(p_same, MMIN(p_left, MMIN(p_right, p_far)));
+        int curr     = COSTS(i, j, d) + e_smooth - s_min_prior;
+
+        ACCUMULATED_COSTS(i, j, d) = curr;
+        s_prior[d] = curr;
+        __syncthreads();
+    }
+}
+
+/* ============================================================
+ * END OF CUDA KERNELS — Parallelisation step 2 (optimised)
  * ============================================================ */
 
 /* ============================================================
@@ -546,7 +856,147 @@ __global__ void kernel_iterate_diryneg(const pixel_t *left_image,
 }
 
 /* ============================================================
- * END OF CUDA KERNELS — Parallelisation step 2
+ * CUDA KERNELS — Texture memory variants
+ *
+ * These kernels replace the global memory versions in sgmDevice()
+ * when texture memory is used. The logic is identical; the only
+ * difference is how the two input images are read:
+ *
+ *   Global memory:   left_image[i + j * nx]
+ *   Texture memory:  tex1Dfetch(tex_left, i + j * nx)
+ *
+ * tex1Dfetch() routes the read through the texture cache, which
+ * is separate from the L1/L2 caches used by global memory. For
+ * access patterns with spatial locality (neighbouring pixels),
+ * this can reduce memory latency significantly.
+ *
+ * Placed after Step 2 so that device_evaluate_path() — defined
+ * there — is already visible when these kernels are compiled.
+ *
+ * Because the texture references are global, these kernels do NOT
+ * receive the image arrays as parameters — they read directly
+ * from tex_left and tex_right.
+ * ============================================================ */
+
+/* ------------------------------------------------------------
+ * kernel_determine_costs_tex
+ *
+ * Same as kernel_determine_costs but reads both images through
+ * the texture cache instead of global memory.
+ * ------------------------------------------------------------ */
+__global__ void kernel_determine_costs_tex(int *costs,
+                                           int nx, int ny, int disp_range)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int d = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (j >= ny || d >= disp_range) return;
+
+    for (int i = d; i < nx; i++) {
+        costs[i * disp_range + j * nx * disp_range + d] =
+            abs(tex1Dfetch(tex_left,  i       + j * nx) -
+                tex1Dfetch(tex_right, (i - d) + j * nx));
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_dirxpos_tex  (left to right, dirx = +1)
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_dirxpos_tex(const int *costs,
+                                           int *accumulated_costs,
+                                           int nx, int ny, int disp_range)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+
+    for (int d = 0; d < disp_range; d++)
+        ACCUMULATED_COSTS(0, j, d) += COSTS(0, j, d);
+
+    for (int i = 1; i < nx; i++) {
+        device_evaluate_path(
+            &ACCUMULATED_COSTS(i-1, j, 0),
+            &COSTS(i, j, 0),
+            abs(tex1Dfetch(tex_left, i     + j * nx) -
+                tex1Dfetch(tex_left, (i-1) + j * nx)),
+            &ACCUMULATED_COSTS(i, j, 0),
+            disp_range);
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_dirxneg_tex  (right to left, dirx = -1)
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_dirxneg_tex(const int *costs,
+                                           int *accumulated_costs,
+                                           int nx, int ny, int disp_range)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= ny) return;
+
+    for (int d = 0; d < disp_range; d++)
+        ACCUMULATED_COSTS(nx-1, j, d) += COSTS(nx-1, j, d);
+
+    for (int i = nx-2; i >= 0; i--) {
+        device_evaluate_path(
+            &ACCUMULATED_COSTS(i+1, j, 0),
+            &COSTS(i, j, 0),
+            abs(tex1Dfetch(tex_left, i     + j * nx) -
+                tex1Dfetch(tex_left, (i+1) + j * nx)),
+            &ACCUMULATED_COSTS(i, j, 0),
+            disp_range);
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_dirypos_tex  (top to bottom, diry = +1)
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_dirypos_tex(const int *costs,
+                                           int *accumulated_costs,
+                                           int nx, int ny, int disp_range)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+
+    for (int d = 0; d < disp_range; d++)
+        ACCUMULATED_COSTS(i, 0, d) += COSTS(i, 0, d);
+
+    for (int j = 1; j < ny; j++) {
+        device_evaluate_path(
+            &ACCUMULATED_COSTS(i, j-1, 0),
+            &COSTS(i, j, 0),
+            abs(tex1Dfetch(tex_left, i + j     * nx) -
+                tex1Dfetch(tex_left, i + (j-1) * nx)),
+            &ACCUMULATED_COSTS(i, j, 0),
+            disp_range);
+    }
+}
+
+/* ------------------------------------------------------------
+ * kernel_iterate_diryneg_tex  (bottom to top, diry = -1)
+ * ------------------------------------------------------------ */
+__global__ void kernel_iterate_diryneg_tex(const int *costs,
+                                           int *accumulated_costs,
+                                           int nx, int ny, int disp_range)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nx) return;
+
+    for (int d = 0; d < disp_range; d++)
+        ACCUMULATED_COSTS(i, ny-1, d) += COSTS(i, ny-1, d);
+
+    for (int j = ny-2; j >= 0; j--) {
+        device_evaluate_path(
+            &ACCUMULATED_COSTS(i, j+1, 0),
+            &COSTS(i, j, 0),
+            abs(tex1Dfetch(tex_left, i + j     * nx) -
+                tex1Dfetch(tex_left, i + (j+1) * nx)),
+            &ACCUMULATED_COSTS(i, j, 0),
+            disp_range);
+    }
+}
+
+/* ============================================================
+ * END OF CUDA KERNELS — Texture memory variants
  * ============================================================ */
 
 /* ============================================================
@@ -578,10 +1028,6 @@ __global__ void kernel_inplace_sum_views(int *im1, const int *im2, int n)
     if (k >= n) return;
     im1[k] += im2[k];
 }
-
-/* ============================================================
- * END OF CUDA KERNELS — Parallelisation step 3
- * ============================================================ */
 
 /* ============================================================
  * CUDA KERNELS — Parallelisation step 4: create_disparity_view
@@ -636,12 +1082,6 @@ __global__ void kernel_create_disparity_view(const int *accumulated_costs,
 /* ============================================================
  * END OF CUDA KERNELS — Parallelisation step 4
  * ============================================================ */
-
-/*
- * Links:
- * http://www.dlr.de/rmc/rm/en/desktopdefault.aspx/tabid-9389/16104_read-39811/
- * http://lunokhod.org/?p=1356
- */
 
 // sgm code to run on the host
 void sgmHost(   const pixel_t *h_leftIm, const pixel_t *h_rightIm, 
@@ -699,57 +1139,58 @@ void sgmDevice( const pixel_t *h_leftIm, const pixel_t *h_rightIm,
 {
     const int nx = w;
     const int ny = h;
-    const int total_elems = nx * ny * disp_range;  /* total entries in any cost volume */
+    const int total_elems = nx * ny * disp_range;
 
     /* ----------------------------------------------------------------
      * Device memory pointers (prefix d_ = lives on GPU VRAM)
      * ---------------------------------------------------------------- */
-    pixel_t *d_left  = NULL;
-    pixel_t *d_right = NULL;
-    int     *d_costs = NULL;
-    int     *d_dir_accumulated = NULL;
+    pixel_t *d_left             = NULL;
+    pixel_t *d_right            = NULL;
+    int     *d_costs            = NULL;
+    int     *d_dir_accumulated  = NULL;
     int     *d_total_accumulated = NULL;
+
     /* ----------------------------------------------------------------
-     * Allocate GPU memory for the two input images and the cost volume
+     * Allocate GPU memory
      * ---------------------------------------------------------------- */
-    checkCudaErrors(cudaMalloc(&d_left,  nx * ny * sizeof(pixel_t)));
-    checkCudaErrors(cudaMalloc(&d_right, nx * ny * sizeof(pixel_t)));
-    checkCudaErrors(cudaMalloc(&d_costs, total_elems * sizeof(int)));
-    checkCudaErrors(cudaMalloc(&d_dir_accumulated, total_elems * sizeof(int)));
+    checkCudaErrors(cudaMalloc(&d_left,             nx * ny * sizeof(pixel_t)));
+    checkCudaErrors(cudaMalloc(&d_right,            nx * ny * sizeof(pixel_t)));
+    checkCudaErrors(cudaMalloc(&d_costs,            total_elems * sizeof(int)));
+    checkCudaErrors(cudaMalloc(&d_dir_accumulated,  total_elems * sizeof(int)));
     checkCudaErrors(cudaMalloc(&d_total_accumulated, total_elems * sizeof(int)));
 
     /* d_total_accumulated starts at zero; directions are summed into it */
     checkCudaErrors(cudaMemset(d_total_accumulated, 0, total_elems * sizeof(int)));
 
     /* ----------------------------------------------------------------
-     * Transfer input images from host RAM to device VRAM
+     * Transfer input images from host RAM to device VRAM, then bind
+     * them to the texture references so all kernels read through the
+     * texture cache instead of going directly to global memory.
      * ---------------------------------------------------------------- */
     checkCudaErrors(cudaMemcpy(d_left,  h_leftIm,  nx * ny * sizeof(pixel_t), cudaMemcpyHostToDevice));
     checkCudaErrors(cudaMemcpy(d_right, h_rightIm, nx * ny * sizeof(pixel_t), cudaMemcpyHostToDevice));
 
-    /* ----------------------------------------------------------------
-     * Step 1 - determine_costs (GPU)
-     *
-     * Step A: fill d_costs with 255.
-     *   Pixels with i < d have no valid right-image match; the original
-     *   sequential code leaves them at 255 via std::fill before the
-     *   loop. We replicate that with a lightweight fill kernel.
-     *
-     * Step B: compute the true costs for i >= d.
-     *   Grid layout: one thread per (j, d) pair.
-     *     blockDim = (16, 16)  ->  256 threads per block
-     *     gridDim.x = ceil(ny          / 16)  -- covers all rows
-     *     gridDim.y = ceil(disp_range  / 16)  -- covers all disparities
-     * ---------------------------------------------------------------- */
+    checkCudaErrors(cudaBindTexture(NULL, tex_left,  d_left,  nx * ny * sizeof(pixel_t)));
+    checkCudaErrors(cudaBindTexture(NULL, tex_right, d_right, nx * ny * sizeof(pixel_t)));
 
-    /* Step A -- initialise cost volume to sentinel value 255 */
+    /* ----------------------------------------------------------------
+     * Step 1 - determine_costs (GPU, shared memory)
+     *
+     * Uses kernel_determine_costs with shared memory: within each block,
+     * the left_image pixel for each row is loaded once into shared memory
+     * and reused by all 16 disparity threads in that row, reducing global
+     * memory traffic by a factor of 16 for that access.
+     *
+     * d_left and d_right are passed as explicit pointers — this kernel
+     * does not use the texture references, which are reserved for the
+     * iterate_direction kernels where the spatial access pattern (pixel
+     * and its immediate neighbour) is a better fit for texture cache.
+     * ---------------------------------------------------------------- */
     {
         int threads = 256;
         int blocks  = (total_elems + threads - 1) / threads;
         kernel_fill<<<blocks, threads>>>(d_costs, 255, total_elems);
     }
-
-    /* Step B -- overwrite valid (i >= d) entries with actual costs */
     {
         dim3 block(16, 16);
         dim3 grid((ny         + block.x - 1) / block.x,
@@ -757,66 +1198,40 @@ void sgmDevice( const pixel_t *h_leftIm, const pixel_t *h_rightIm,
         kernel_determine_costs<<<grid, block>>>(d_left, d_right, d_costs,
                                                 nx, ny, disp_range);
     }
-
-    /* Synchronise: ensure all GPU work above is complete before we read
-     * back the result. Every kernel launch is asynchronous by default. */
     checkCudaErrors(cudaDeviceSynchronize());
 
     /* ----------------------------------------------------------------
-     * Copy cost volume back to host -- Steps 2-4 still run on the CPU.
-     * This round-trip is temporary: in the next steps we will keep
-     * d_costs on the GPU and move the remaining computation there too.
+     * Steps 2 + 3 - iterate_direction (optimised) + inplace_sum_views
+     *
+     * Grid layout for the optimised direction kernels:
+     *   blockDim = disp_range (32 threads — one per disparity, one warp)
+     *   gridDim  = ny (horizontal) or nx (vertical)
+     *
+     * This gives 375×32 = 12,000 active threads for horizontal kernels,
+     * vs 375 threads in the original version — ~32× more parallelism
+     * in the direction step.
      * ---------------------------------------------------------------- */
-    int *h_costs = (int *) malloc(total_elems * sizeof(int));
-    if (h_costs == NULL) {
-        fprintf(stderr, "sgmDevice: failed to allocate h_costs.\n");
-        exit(1);
-    }
-    checkCudaErrors(cudaMemcpy(h_costs, d_costs, total_elems * sizeof(int), cudaMemcpyDeviceToHost));
-
-    /* ----------------------------------------------------------------
-     * Steps 2 + 3 - iterate_direction (GPU) + inplace_sum_views (GPU)
-     *
-     * For each of the four scanning directions:
-     *   1. Reset d_dir_accumulated to zero.
-     *   2. Launch the direction kernel — result stays in VRAM.
-     *   3. Launch the sum kernel — d_dir is added into d_total in VRAM.
-     *
-     * No CPU round-trip: d_costs, d_dir and d_total never leave the GPU.
-     *
-     * Grid sizing for the sum kernel: one thread per element → 1-D grid.
-     * ---------------------------------------------------------------- */
-
-    /* 1-D grid covering all rows (used by horizontal kernels) */
-    int row_threads = 256;
-    int row_blocks  = (ny + row_threads - 1) / row_threads;
-
-    /* 1-D grid covering all columns (used by vertical kernels) */
-    int col_threads = 256;
-    int col_blocks  = (nx + col_threads - 1) / col_threads;
-
-    /* 1-D grid for the sum kernel */
     int sum_threads = 256;
     int sum_blocks  = (total_elems + sum_threads - 1) / sum_threads;
 
     /* --- Direction: left to right (dirx = +1) --- */
     checkCudaErrors(cudaMemset(d_dir_accumulated, 0, total_elems * sizeof(int)));
-    kernel_iterate_dirxpos<<<row_blocks, row_threads>>>(d_left, d_costs, d_dir_accumulated, nx, ny, disp_range);
+    kernel_iterate_dirxpos<<<ny, disp_range>>>(d_costs, d_dir_accumulated, nx, ny, disp_range);
     kernel_inplace_sum_views<<<sum_blocks, sum_threads>>>(d_total_accumulated, d_dir_accumulated, total_elems);
 
     /* --- Direction: right to left (dirx = -1) --- */
     checkCudaErrors(cudaMemset(d_dir_accumulated, 0, total_elems * sizeof(int)));
-    kernel_iterate_dirxneg<<<row_blocks, row_threads>>>(d_left, d_costs, d_dir_accumulated, nx, ny, disp_range);
+    kernel_iterate_dirxneg<<<ny, disp_range>>>(d_costs, d_dir_accumulated, nx, ny, disp_range);
     kernel_inplace_sum_views<<<sum_blocks, sum_threads>>>(d_total_accumulated, d_dir_accumulated, total_elems);
 
     /* --- Direction: top to bottom (diry = +1) --- */
     checkCudaErrors(cudaMemset(d_dir_accumulated, 0, total_elems * sizeof(int)));
-    kernel_iterate_dirypos<<<col_blocks, col_threads>>>(d_left, d_costs, d_dir_accumulated, nx, ny, disp_range);
+    kernel_iterate_dirypos<<<nx, disp_range>>>(d_costs, d_dir_accumulated, nx, ny, disp_range);
     kernel_inplace_sum_views<<<sum_blocks, sum_threads>>>(d_total_accumulated, d_dir_accumulated, total_elems);
 
     /* --- Direction: bottom to top (diry = -1) --- */
     checkCudaErrors(cudaMemset(d_dir_accumulated, 0, total_elems * sizeof(int)));
-    kernel_iterate_diryneg<<<col_blocks, col_threads>>>(d_left, d_costs, d_dir_accumulated, nx, ny, disp_range);
+    kernel_iterate_diryneg<<<nx, disp_range>>>(d_costs, d_dir_accumulated, nx, ny, disp_range);
     kernel_inplace_sum_views<<<sum_blocks, sum_threads>>>(d_total_accumulated, d_dir_accumulated, total_elems);
 
     checkCudaErrors(cudaDeviceSynchronize());
@@ -851,8 +1266,13 @@ void sgmDevice( const pixel_t *h_leftIm, const pixel_t *h_rightIm,
                                nx * ny * sizeof(pixel_t), cudaMemcpyDeviceToHost));
 
     /* ----------------------------------------------------------------
-     * Cleanup: free all host and device allocations
+     * Cleanup: unbind textures and free all device allocations.
+     * Textures must be unbound before the underlying device memory
+     * is freed — accessing a bound texture after cudaFree is undefined.
      * ---------------------------------------------------------------- */
+    cudaUnbindTexture(tex_left);
+    cudaUnbindTexture(tex_right);
+
     checkCudaErrors(cudaFree(d_left));
     checkCudaErrors(cudaFree(d_right));
     checkCudaErrors(cudaFree(d_costs));
@@ -860,7 +1280,7 @@ void sgmDevice( const pixel_t *h_leftIm, const pixel_t *h_rightIm,
     checkCudaErrors(cudaFree(d_total_accumulated));
     checkCudaErrors(cudaFree(d_disp));
 }
-   
+
 // print command line format
 void usage(char *command) 
 {
