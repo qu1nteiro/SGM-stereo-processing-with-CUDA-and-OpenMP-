@@ -1,0 +1,79 @@
+
+======================================================================
+  SGM CUDA Benchmark
+  Runs per image : 20  (1 warmup + 19 timed)
+  Date           : dom mai 10 18:33:41 WEST 2026
+======================================================================
+
+  ------------------------------------------------------------------
+  Processing image: bull
+  ------------------------------------------------------------------
+
+  Image: bull
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    Device (ms)      Speedup
+  Mean:               2083.40         566.08         3.7x
+  Std Dev:              40.90          14.19
+  Min:                2026.06         547.81
+  Max:                2139.52         581.68
+
+
+  ------------------------------------------------------------------
+  Processing image: cones
+  ------------------------------------------------------------------
+
+  Image: cones
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    Device (ms)      Speedup
+  Mean:               2179.20         696.46         3.1x
+  Std Dev:              43.56          10.73
+  Min:                2120.11         682.81
+  Max:                2243.72         713.07
+
+
+  ------------------------------------------------------------------
+  Processing image: teddy
+  ------------------------------------------------------------------
+
+  Image: teddy
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    Device (ms)      Speedup
+  Mean:               2150.70         699.73         3.1x
+  Std Dev:              43.08          11.05
+  Min:                2087.29         682.76
+  Max:                2217.05         714.91
+
+
+  ------------------------------------------------------------------
+  Processing image: venus
+  ------------------------------------------------------------------
+
+  Image: venus
+  Correctness: PASS
+  Runs: 19 (1 warmup discarded)
+
+                    Host (ms)    Device (ms)      Speedup
+  Mean:               2055.98         585.87         3.5x
+  Std Dev:              43.51          14.71
+  Min:                1999.48         566.54
+  Max:                2116.83         602.67
+
+
+======================================================================
+  SUMMARY
+======================================================================
+  Image     Correctness    Mean Host(ms)    Mean Dev(ms)     Speedup
+  ------------------------------------------------------------------
+  bull      PASS                 2083.40          566.08        3.7x
+  cones     PASS                 2179.20          696.46        3.1x
+  teddy     PASS                 2150.70          699.73        3.1x
+  venus     PASS                 2055.98          585.87        3.5x
+
+  Full results saved to: results_cuda.txt
+

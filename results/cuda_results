@@ -1,0 +1,115 @@
+# SGM CUDA — Resumo de Resultados
+
+## Ambiente de execução
+- **Servidor:** banana.ua.pt
+- **GPU:** NVIDIA GeForce GTX 1660 Ti (6GB, compute capability 7.5, sm_75)
+- **CUDA:** 10.2
+- **Compilação:** `nvcc -arch=sm_30 -O3 -ICommon`
+- **Imagem de referência:** lbull.pgm / rbull.pgm (450×375 px, disp_range=32)
+
+---
+
+## 1. Evolução por etapas CUDA (imagem bull)
+
+| Etapa | O que corre na GPU | Device time | Speedup vs Host (~2100ms) |
+|-------|-------------------|-------------|--------------------------|
+| Etapa 1 | `determine_costs` | ~2111 ms | ≈ 1.0× |
+| Etapa 2 | + `iterate_direction` (4 dir.) | ~608 ms | 3.5× |
+| Etapa 3 | + `inplace_sum_views` | ~564 ms | 3.6× |
+| Etapa 4 | + `create_disparity_view` | ~558 ms | 3.8× |
+
+> **Nota:** Os tempos das Etapas 1 e 2 foram medidos com cuda-memcheck (overhead).
+> Os tempos das Etapas 3 e 4 são sem cuda-memcheck (valores reais).
+
+**Porquê a Etapa 2 piorou temporariamente:**
+A Etapa 2 introduziu 4 `cudaMemcpy` de volta ao CPU (~21MB cada) para fazer
+`inplace_sum_views` na CPU. A Etapa 3 eliminou esses round-trips, mantendo
+os dados na VRAM — daí o salto de ~608ms para ~564ms.
+
+---
+
+## 2. Comparação de tipos de memória (pipeline completo, imagem bull)
+
+| Versão | Memória usada | Device time | Speedup vs Host |
+|--------|--------------|-------------|-----------------|
+| Global | global em tudo | ~558 ms | 3.6× |
+| Texture | texture nas imagens (left/right) | ~550 ms | 3.7× |
+| Shared (16×16) | shared em `determine_costs` | ~553 ms | 3.7× |
+| Shared (8×32) | shared + block size optimizado | ~550 ms | 3.7× |
+| Combined | shared + texture + global | ~550 ms | 3.7× |
+| **Optimized** | parallel reduction + shared + texture | **~6.2 ms** | **330×** |
+
+**Nota sobre sm_75 vs sm_30:** testado sem diferença mensurável nos tempos.
+O bottleneck não era o compilador mas o algoritmo.
+
+---
+
+## 3. Versão Optimized — detalhe da optimização
+
+**Problema identificado:** `device_evaluate_path` fazia um loop O(disp_range²)=O(1024)
+por coluna, com apenas 375 threads activos (~25% de ocupação da GPU).
+
+**Solução aplicada (suportada nos slides de cuda_reduction.pdf):**
+- 1 bloco por caminho (linha ou coluna), com `disp_range=32` threads por bloco
+- **Parallel reduction** com sequential addressing (slide 15) para calcular `min_prior`
+- **Fórmula O(1) por thread** para o smoothness:
+  ```
+  e_smooth(d) = min(prior[d], prior[d-1]+P1, prior[d+1]+P1, min_prior+P_big)
+  ```
+- **Coalesced writes:** 32 threads escrevem para endereços consecutivos em `d_costs`
+
+**Resultado:**
+- Antes: 375 threads × O(32²) ops/coluna
+- Depois: 375×32 = 12,000 threads × O(log32+1) ops/coluna
+
+---
+
+## 4. Versão Optimized — múltiplas imagens
+
+Todos os testes validados com `./testDiffs` → "images are identical".
+
+| Imagem | Host time | Device time | Speedup |
+|--------|-----------|-------------|---------|
+| bull   | ~2024 ms  | ~6.2 ms     | ~330×   |
+| cones  | ~2114 ms  | ~6.2 ms     | ~341×   |
+| teddy  | ~2179 ms  | ~6.2 ms     | ~351×   |
+| venus  | ~2032 ms  | ~6.2 ms     | ~329×   |
+
+**Observação importante:** o Device time é praticamente constante (~6.2ms)
+independentemente da imagem. Isto indica que o tempo de execução dos kernels
+GPU está limitado por um factor fixo (latência de lançamento, cudaMemcpy das
+imagens de entrada/saída) e não pelo tamanho da imagem — o que demonstra
+excelente escalabilidade da implementação GPU.
+
+---
+
+## 5. Comparação OpenMP vs CUDA (imagem bull)
+
+| Implementação | Tempo | Speedup vs Sequencial |
+|--------------|-------|----------------------|
+| Host (sequencial) | ~2024 ms | 1× |
+| OpenMP (versão final) | ? ms | ?× |
+| CUDA global (Etapa 4) | ~558 ms | 3.6× |
+| CUDA optimized | ~6.2 ms | ~330× |
+
+> ⚠️ Preencher com os tempos finais do OpenMP.
+
+---
+
+## 6. Notas para o relatório
+
+- **cuda-memcheck obrigatório** antes de qualquer execução directa na GPU (regra do enunciado)
+- Todos os resultados validados com `./testDiffs` → "images are identical"
+- A variação de ~550ms vs ~580ms nas versões de memória é ruído de scheduling do servidor, não diferença real
+- O speedup de 330× só foi possível ao identificar que `device_evaluate_path` era
+  o bottleneck e ao reformulá-lo usando parallel reduction dos slides
+- **Ficheiros entregues:**
+  - `sgmCuda_stage_global_version1.cu` — Etapa 1
+  - `sgmCuda_stage_global_version2.cu` — Etapas 1-2
+  - `sgmCuda_stage_global_version3.cu` — Etapas 1-3
+  - `sgmCuda_stage_global_version4.cu` — Etapas 1-4 (global memory)
+  - `sgmCuda_stage_texture_version1.cu` — texture memory
+  - `sgmCuda_stage_shared_version1.cu` — shared memory (16×16)
+  - `sgmCuda_stage_shared_version2.cu` — shared memory (8×32 optimizado)
+  - `sgmCuda_stage_combined_version1.cu` — combined (shared+texture+global)
+  - `sgmCuda.cu` — versão final optimizada (parallel reduction)
